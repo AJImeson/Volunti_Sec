@@ -1,0 +1,16 @@
+# Policy as Code check — validates K3s manifests against the NIS2 policies
+# in policy/*.rego. A 'deny' fails this job; 'warn' only prints.
+#
+# allow_failure: true makes this report-only for now — the job shows up as an
+# orange warning (!) in the pipeline instead of blocking it, since the existing
+# manifests don't yet pass the NIS2 checks. Remove that line once the gaps are
+# fixed to turn the policy into a hard gate.
+
+policy-check:
+  stage: security
+  allow_failure: true
+  image:
+    name: openpolicyagent/conftest:latest
+    entrypoint: [""] # image's default entrypoint is conftest itself; clear it so GitLab can run the script
+  script:
+    - conftest test K3s/ --policy policy/

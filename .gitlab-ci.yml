@@ -33,6 +33,7 @@ include:
   - local: 'frontend/test.yml'
   - local: 'frontend/container-build.yml'
   - local: 'frontend/deploy.yml'
+  - local: 'policy/policy-check.yml'
   - template: Security/SAST.gitlab-ci.yml
   - template: Jobs/Secret-Detection.gitlab-ci.yml
 
