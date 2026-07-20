@@ -2,9 +2,19 @@
 # NIS2 policies in policy/*.rego. GitHub-native counterpart to the GitLab job
 # in policy/policy-check.yml.
 #
+# The manifests are envsubst templates (${IMAGE_TAG}, ${PREFIX}, host names)
+# that deploy.py renders before `kubectl apply`. Conftest must validate the
+# SAME rendered YAML that reaches the cluster, so we render first (envsubst in
+# allow-list mode, leaving the $(MSSQL_SA_PASSWORD) runtime ref literal) and
+# then run conftest on the rendered output.
+#
+# Runs on ubuntu-latest (not inside the conftest container) because
+# actions/checkout is a Node action and the Alpine conftest image has no Node.
+# conftest itself runs via its official image with `docker run`.
+#
 # continue-on-error: true makes this report-only for now — the run is marked
-# with a warning instead of a red X, since the existing manifests don't yet
-# pass the NIS2 checks. Remove that line to turn the policy into a hard gate.
+# with a warning instead of a red X, since the manifests still miss the NIS2
+# scope labels (nis2.eu/*). Remove that line to turn the policy into a hard gate.
 
 name: policy-check
 
@@ -17,9 +27,18 @@ jobs:
   conftest:
     runs-on: ubuntu-latest
     continue-on-error: true
-    container:
-      image: openpolicyagent/conftest:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run NIS2 policy checks
-        run: conftest test K3s/ --policy policy/
+      - name: Render manifests and run NIS2 policy checks
+        run: |
+          set -euo pipefail
+          command -v envsubst >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y gettext-base; }
+          export IMAGE_TAG="${GITHUB_SHA::8}"
+          export PREFIX=""
+          mkdir -p rendered
+          for f in $(find K3s -name '*.yaml'); do
+            envsubst '${PREFIX} ${IMAGE_TAG} ${ASPNET_ENV} ${FRONTEND_HOST} ${BACKEND_HOST} ${ADMINER_HOST} ${BACKEND_URL}' \
+              < "$f" > "rendered/$(echo "$f" | tr '/' '_')"
+          done
+          docker run --rm -v "$PWD:/project" -w /project openpolicyagent/conftest:latest \
+            test rendered/ --policy policy/

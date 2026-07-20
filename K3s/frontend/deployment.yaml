@@ -17,7 +17,7 @@ spec:
         - name: registry-credentials
       containers:
       - name: ${PREFIX}volunti-frontend
-        image: registry.chas-lab.dev/chas-challenge-2026/grupp-13/burgundy/frontend:latest
+        image: registry.chas-lab.dev/chas-challenge-2026/grupp-13/burgundy/frontend:${IMAGE_TAG}
         imagePullPolicy: Always
         ports:
         - containerPort: 80

@@ -28,6 +28,11 @@ if len(TAG) != 8:
     )
     sys.exit(1)
 
+# Expose the resolved tag to envsubst so manifests can pin `image: .../{comp}:${IMAGE_TAG}`
+# at render time. This replaces the old post-apply `kubectl set image` override, so the
+# manifest that gets applied is the one that actually runs (and that policy checks can see).
+os.environ["IMAGE_TAG"] = TAG
+
 def run_script(cmd, check=True):
     print(f"$ {' '.join(cmd)}", flush=True)
     result = subprocess.run(cmd, text=True)
@@ -62,13 +67,6 @@ def apply_manifests(component): # Applies all manifests
             apply_manifest(k3s_file)
    
 
-def create_image(component):
-    image = f"{REGISTRY}/{component}:{TAG}"
-    run_script(["kubectl", "set", "image",
-                f"deployment/{PREFIX}volunti-{component}",
-                f"{PREFIX}volunti-{component}={image}",
-                "-n", NAMESPACE])
-
 def rollout_status(component):
     run_script(["kubectl", "rollout", "status",
                 f"deployment/{PREFIX}volunti-{component}",
@@ -80,7 +78,6 @@ def main():
         sys.exit(1)
     print(f"Deploying {COMPONENT}:{NAMESPACE}:{TAG}")
     apply_manifests(COMPONENT)
-    create_image(COMPONENT)
     rollout_status(COMPONENT)
     print(f"Succesfully deployed {COMPONENT}")
 
