@@ -56,6 +56,29 @@ spec:
           runAsNonRoot: true
           runAsUser: 10001
           allowPrivilegeEscalation: false
+        # Health checks run a real 'SELECT 1' via sqlcmd (tools18 -> needs -C to
+        # trust the self-signed cert). $MSSQL_SA_PASSWORD comes from the env/secret
+        # and is expanded by the shell at runtime (envsubst leaves it untouched).
+        # startupProbe absorbs the slow first start so liveness can't restart-loop
+        # a booting SQL Server; no readinessProbe on purpose — on a single-replica
+        # DB a flapping readiness drops the only endpoint and causes an outage.
+        startupProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -Q "SELECT 1"'
+          periodSeconds: 10
+          failureThreshold: 30 # up to ~5 min for a fresh-PVC first start
+        livenessProbe:
+          exec:
+            command:
+              - /bin/sh
+              - -c
+              - '/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$MSSQL_SA_PASSWORD" -C -Q "SELECT 1"'
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3 # ~60s sustained failure before restart
   volumeClaimTemplates:
   - metadata:
       name: mssql-data
