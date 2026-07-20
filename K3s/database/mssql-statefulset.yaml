@@ -4,6 +4,11 @@ kind: StatefulSet
 metadata:
   name: ${PREFIX}mssql-sts
   namespace: doe25-group-13
+  labels:
+    app: ${PREFIX}mssql-sts
+    nis2.eu/entity-classification: important
+    nis2.eu/sector: digital-provider
+    nis2.eu/owner: doe25-group-13
 spec:
   selector:
     matchLabels:

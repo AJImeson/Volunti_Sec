@@ -40,5 +40,8 @@ jobs:
             envsubst '${PREFIX} ${IMAGE_TAG} ${ASPNET_ENV} ${FRONTEND_HOST} ${BACKEND_HOST} ${ADMINER_HOST} ${BACKEND_URL}' \
               < "$f" > "rendered/$(echo "$f" | tr '/' '_')"
           done
+          # --all-namespaces is required: our rules live in packages nis2.chapter1 /
+          # nis2.chapter4, and conftest only evaluates the 'main' namespace by
+          # default (without it conftest reports "0 tests" and passes trivially).
           docker run --rm -v "$PWD:/project" -w /project openpolicyagent/conftest:latest \
-            test rendered/ --policy policy/
+            test rendered/ --policy policy/ --all-namespaces

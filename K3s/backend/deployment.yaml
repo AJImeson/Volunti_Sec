@@ -4,7 +4,10 @@ metadata:
   name: ${PREFIX}volunti-backend
   namespace: doe25-group-13
   labels:
-    app: ${PREFIX}volunti-backend 
+    app: ${PREFIX}volunti-backend
+    nis2.eu/entity-classification: important
+    nis2.eu/sector: digital-provider
+    nis2.eu/owner: doe25-group-13
 spec:
   replicas: 1
   selector:
