@@ -48,6 +48,14 @@ spec:
           limits:
             cpu: "1000m"
             memory: "2Gi"
+        # The mssql/server:2022 image already runs as the non-root 'mssql' user
+        # (uid 10001) by default, so declaring it here matches current runtime
+        # behaviour (no change to volume ownership). fsGroup is intentionally
+        # omitted since /var/opt/mssql is already writable by 10001 today.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 10001
+          allowPrivilegeEscalation: false
   volumeClaimTemplates:
   - metadata:
       name: mssql-data

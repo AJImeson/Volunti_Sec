@@ -42,5 +42,11 @@ spec:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 20
+        # adminer:4.8.1 already runs as the non-root 'adminer' user (uid 999)
+        # on unprivileged port 8080 — declare it so the platform enforces it.
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 999
+          allowPrivilegeEscalation: false
 
 ---
