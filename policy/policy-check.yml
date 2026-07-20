@@ -11,14 +11,12 @@
 # substitutes the seven template variables and leaves everything else literal —
 # notably the `$(MSSQL_SA_PASSWORD)` kubelet runtime reference.
 #
-# allow_failure: true keeps this report-only for now — the job shows up as an
-# orange warning (!) instead of blocking, since the manifests still miss the
-# NIS2 scope labels (nis2.eu/*). Remove that line once those gaps are closed to
-# turn the policy into a hard gate.
+# This is a hard gate: a 'deny' fails the pipeline and blocks the deploy stage
+# (warnings still only print). To temporarily make it report-only again, add
+# `allow_failure: true` under the job.
 
 policy-check:
   stage: security
-  allow_failure: true
   image:
     name: openpolicyagent/conftest:latest
     entrypoint: [""] # image's default entrypoint is conftest itself; clear it so GitLab can run the script

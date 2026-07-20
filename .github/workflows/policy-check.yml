@@ -12,9 +12,8 @@
 # actions/checkout is a Node action and the Alpine conftest image has no Node.
 # conftest itself runs via its official image with `docker run`.
 #
-# continue-on-error: true makes this report-only for now — the run is marked
-# with a warning instead of a red X, since the manifests still miss the NIS2
-# scope labels (nis2.eu/*). Remove that line to turn the policy into a hard gate.
+# This is a hard gate: a 'deny' fails the job (warnings still only print). To
+# temporarily make it report-only again, add `continue-on-error: true` to the job.
 
 name: policy-check
 
@@ -26,7 +25,6 @@ on:
 jobs:
   conftest:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Render manifests and run NIS2 policy checks
