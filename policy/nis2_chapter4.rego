@@ -37,6 +37,8 @@ containers contains c if {
 	some c in input.spec.template.spec.containers
 }
 
+labels := object.get(input, ["metadata", "labels"], {})
+
 # -----------------------------------------------------------------------------
 # Art. 21(2)(d) — Supply chain security
 # Images must be pinned to a specific tag so you know exactly what runs.
@@ -108,13 +110,30 @@ warn contains msg if {
 
 # -----------------------------------------------------------------------------
 # Art. 21(2)(c) — Business continuity
-# A single replica means any node failure is an outage.
+# Redundancy expectations differ by workload type:
+#   - Deployment: stateless, so horizontal redundancy applies directly —
+#     a single replica means any node failure is an outage. Warn on < 2.
+#   - StatefulSet: a database/stateful workload is NOT made resilient by adding
+#     replicas (a 2nd replica is a separate data copy, not HA). Continuity for
+#     these comes from a backup/DR strategy, so require it to be *declared* via
+#     the 'nis2.eu/continuity-strategy' label rather than counting replicas.
+#   - DaemonSet: already runs one pod per node, so node-level distribution is
+#     inherent — no continuity warning.
 # -----------------------------------------------------------------------------
 warn contains msg if {
-	is_workload
+	input.kind == "Deployment"
 	object.get(input, ["spec", "replicas"], 1) < 2
 	msg := sprintf(
-		"[NIS2 Art.21(2)(c)] %s '%s': fewer than 2 replicas — no resilience against node failure",
-		[input.kind, input.metadata.name],
+		"[NIS2 Art.21(2)(c)] Deployment '%s': fewer than 2 replicas — no resilience against node failure",
+		[input.metadata.name],
+	)
+}
+
+warn contains msg if {
+	input.kind == "StatefulSet"
+	not labels["nis2.eu/continuity-strategy"]
+	msg := sprintf(
+		"[NIS2 Art.21(2)(c)] StatefulSet '%s': missing label 'nis2.eu/continuity-strategy' — declare the backup/DR approach (replicas do not provide HA for stateful workloads)",
+		[input.metadata.name],
 	)
 }

@@ -9,7 +9,7 @@ metadata:
     nis2.eu/sector: digital-provider
     nis2.eu/owner: doe25-group-13
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: ${PREFIX}adminer
