@@ -43,3 +43,10 @@ jobs:
           # default (without it conftest reports "0 tests" and passes trivially).
           docker run --rm -v "$PWD:/project" -w /project openpolicyagent/conftest:latest \
             test rendered/ --policy policy/ --all-namespaces
+          # Second pass with --combine: rules in nis2.continuity need to see all
+          # the manifests at once to check relationships *between* them (a
+          # StatefulSet claiming 'backup-restore' must be named by a real backup
+          # CronJob). Those rules no-op in the per-document pass above, and the
+          # per-document rules no-op here, so policy/ serves both.
+          docker run --rm -v "$PWD:/project" -w /project openpolicyagent/conftest:latest \
+            test rendered/ --policy policy/ --all-namespaces --combine

@@ -1,0 +1,116 @@
+# https://kubernetes.io/docs/concepts/workloads/controllers/cron-jobs/
+#
+# NIS2 Art.21(2)(c) — business continuity / backup management.
+# The mssql StatefulSet declares `nis2.eu/continuity-strategy: backup-restore`.
+# This CronJob is what makes that label true: without it the label asserts a
+# control that does not exist. policy/nis2_continuity.rego enforces the link
+# (a StatefulSet claiming 'backup-restore' must be named by a backup CronJob).
+#
+# Design notes:
+#   - BACKUP DATABASE writes on the *server's* filesystem, not the client's, so
+#     this pod needs no volume mount — it only speaks TDS via sqlcmd. The .bak
+#     lands in /var/opt/mssql/backups, which is inside the StatefulSet's
+#     existing mssql-data PVC. That means no second volumeClaimTemplate (those
+#     are immutable on an existing StatefulSet and would break `kubectl apply`).
+#     RESIDUAL RISK: backups share a volume with the data they protect. This
+#     covers logical loss (bad migration, accidental DROP, corrupted table) but
+#     NOT loss of the PVC/node. Shipping the .bak off-cluster is the next step.
+#   - Retention is a 7-slot rotation keyed on day-of-week (volunti-Mon.bak …).
+#     WITH FORMAT/INIT overwrites the slot, so the set is self-limiting and
+#     needs no file-deletion logic (this pod has no filesystem access anyway).
+#   - sqlcmd needs -b, otherwise it exits 0 even when the T-SQL fails and the
+#     job would report success while backing up nothing.
+#   - RESTORE VERIFYONLY runs every night: an unverified backup is not a backup.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: ${PREFIX}mssql-backup
+  namespace: doe25-group-13
+  labels:
+    app: ${PREFIX}mssql-backup
+    nis2.eu/entity-classification: important
+    nis2.eu/sector: digital-provider
+    nis2.eu/owner: doe25-group-13
+    nis2.eu/role: backup
+    nis2.eu/backup-target: ${PREFIX}mssql-sts
+spec:
+  schedule: "15 2 * * *"
+  timeZone: "Etc/UTC"
+  # Forbid: a backup still running when the next one is due must not be joined
+  # by a second one competing for the same file and the same server.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  # Keep enough history that a failed night is still visible the next morning.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: ${PREFIX}mssql-backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: mssql-backup
+              # Reuse the server image: it already carries sqlcmd at a known
+              # path and is guaranteed to be present on the node, so the backup
+              # never fails on an image pull.
+              image: mcr.microsoft.com/mssql/server:2022-latest
+              env:
+                - name: MSSQL_SA_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mssql-secret
+                      key: MSSQL_SA_PASSWORD
+                - name: MSSQL_HOST
+                  value: "${PREFIX}mssql-service"
+                - name: DB_NAME
+                  value: "volunti"
+                - name: BACKUP_DIR
+                  value: "/var/opt/mssql/backups"
+              command: ["/bin/bash", "-c"]
+              # envsubst runs in allow-list mode, so $BACKUP_DIR / $DB_NAME /
+              # $MSSQL_SA_PASSWORD survive rendering and are expanded here at
+              # runtime by bash.
+              args:
+                - |
+                  set -euo pipefail
+                  SQLCMD=/opt/mssql-tools18/bin/sqlcmd
+                  DOW="$(date -u +%a)"
+                  TARGET="$BACKUP_DIR/$DB_NAME-$DOW.bak"
+
+                  # -C trusts the self-signed server cert (same as the probes),
+                  # -b makes a T-SQL error a non-zero exit so the Job fails.
+                  run() {
+                    "$SQLCMD" -S "$MSSQL_HOST" -U sa -P "$MSSQL_SA_PASSWORD" \
+                      -C -b -l 30 -Q "$1"
+                  }
+
+                  echo "[backup] ensuring $BACKUP_DIR exists on the server"
+                  run "EXEC master.dbo.xp_create_subdir '$BACKUP_DIR'"
+
+                  echo "[backup] backing up [$DB_NAME] -> $TARGET"
+                  run "BACKUP DATABASE [$DB_NAME] TO DISK = '$TARGET' \
+                       WITH FORMAT, INIT, CHECKSUM, COMPRESSION, STATS = 10"
+
+                  echo "[backup] verifying $TARGET"
+                  run "RESTORE VERIFYONLY FROM DISK = '$TARGET' WITH CHECKSUM"
+
+                  echo "[backup] OK: $TARGET"
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+---
