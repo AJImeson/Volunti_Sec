@@ -28,6 +28,43 @@ per-document and once with `--combine`. The two rule sets are mutually
 inert (the combine rules require an array input, the per-document rules require
 an object), so one `policy/` directory serves both passes.
 
+The same pattern covers the off-site copy: `nis2.eu/backup-offsite: "true"` is
+only honoured if the job actually has a destination bucket and takes its
+object-storage credentials from a Secret. Hardcode the key, or blank the
+bucket, and the gate fails.
+
+## Off-site backup credentials
+
+`K3s/database/mssql-backup-cronjob.yaml` ships the nightly `.bak` to
+S3-compatible object storage, which needs a Secret named `mssql-backup-s3`.
+**It does not exist yet** — create it once, per environment:
+
+```bash
+kubectl create secret generic mssql-backup-s3 \
+  --namespace doe25-group-13 \
+  --from-literal=S3_ACCESS_KEY_ID='<access-key>' \
+  --from-literal=S3_SECRET_ACCESS_KEY='<secret-key>' \
+  --dry-run=client -o yaml \
+| kubeseal --format yaml > K3s/base/sealed-secret-backup-s3.yaml
+```
+
+Commit the *sealed* file only — a plaintext `kind: Secret` is denied by
+`nis2_chapter4.rego` under Art. 21(2)(h). Then point the job at the bucket by
+editing `S3_BUCKET`, `RCLONE_CONFIG_OFFSITE_ENDPOINT` and
+`RCLONE_CONFIG_OFFSITE_PROVIDER` in the CronJob (leave the endpoint empty and
+set `RCLONE_CONFIG_OFFSITE_REGION` for real AWS S3).
+
+Until the Secret exists the nightly Job **fails on purpose**: the local backup
+still runs, but the upload stage exits non-zero rather than skipping quietly, so
+a missing off-site copy is visible instead of silently assumed.
+
+Give the key the narrowest policy that works — `PutObject`/`GetObject` on
+`s3://<bucket>/mssql/*` and nothing else. It is read-only against the cluster
+but write-capable against the bucket, so treat it as a credential an attacker
+would want. Enable object versioning or an object-lock/immutability policy on
+the bucket if the provider supports it: without that, the same key that writes
+tonight's backup can overwrite every previous one.
+
 ## How it works
 
 Chapter I of NIS2 is about *who* is in scope and *how* entities are classified —

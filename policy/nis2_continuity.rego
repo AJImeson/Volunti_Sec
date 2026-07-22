@@ -34,15 +34,28 @@ import rego.v1
 # 1. Batch workloads (CronJob / Job) — the coverage gap in chapter4
 # -----------------------------------------------------------------------------
 
-# A CronJob nests its pod spec one level deeper than a Job.
-batch_containers contains c if {
+# A CronJob nests its pod spec one level deeper than a Job. initContainers must
+# be walked too: an initContainer is a real container with the same image and
+# the same credentials, so leaving them out would let a workload dodge every
+# check below just by moving a step into the init phase.
+batch_pod_specs contains spec if {
 	input.kind == "CronJob"
-	some c in input.spec.jobTemplate.spec.template.spec.containers
+	spec := input.spec.jobTemplate.spec.template.spec
+}
+
+batch_pod_specs contains spec if {
+	input.kind == "Job"
+	spec := input.spec.template.spec
 }
 
 batch_containers contains c if {
-	input.kind == "Job"
-	some c in input.spec.template.spec.containers
+	some spec in batch_pod_specs
+	some c in object.get(spec, "containers", [])
+}
+
+batch_containers contains c if {
+	some spec in batch_pod_specs
+	some c in object.get(spec, "initContainers", [])
 }
 
 # Art. 21(2)(d) — supply chain security. Same pinning rule as chapter4.
@@ -93,6 +106,67 @@ deny contains msg if {
 	not labels["nis2.eu/backup-target"]
 	msg := sprintf(
 		"[NIS2 Art.21(2)(c)] CronJob '%s' is labelled 'nis2.eu/role: backup' but declares no 'nis2.eu/backup-target'",
+		[input.metadata.name],
+	)
+}
+
+# -----------------------------------------------------------------------------
+# Art. 21(2)(c) — off-site copy (3-2-1)
+# A backup stored only next to the data it protects survives a bad migration
+# but not the loss of the volume, node or cluster. 'nis2.eu/backup-offsite' is
+# again only a claim, so verify the job is structurally capable of honouring
+# it: a destination bucket and credentials that come from a Secret. This does
+# not prove bytes leave the cluster — it does stop the label being set on a job
+# with no off-site path at all.
+# -----------------------------------------------------------------------------
+declares_offsite if {
+	labels := object.get(input, ["metadata", "labels"], {})
+	labels["nis2.eu/backup-offsite"] == "true"
+}
+
+offsite_bucket_env contains c.name if {
+	some c in batch_containers
+	some e in object.get(c, "env", [])
+	e.name == "S3_BUCKET"
+	e.value != ""
+}
+
+offsite_credential_env contains c.name if {
+	some c in batch_containers
+	some e in object.get(c, "env", [])
+	object.get(e, ["valueFrom", "secretKeyRef", "name"], "") != ""
+	contains(lower(e.name), "secret_access_key")
+}
+
+deny contains msg if {
+	input.kind in {"CronJob", "Job"}
+	declares_offsite
+	count(offsite_bucket_env) == 0
+	msg := sprintf(
+		"[NIS2 Art.21(2)(c)] %s '%s' claims 'nis2.eu/backup-offsite: true' but no container sets a non-empty 'S3_BUCKET' — there is no off-site destination",
+		[input.kind, input.metadata.name],
+	)
+}
+
+deny contains msg if {
+	input.kind in {"CronJob", "Job"}
+	declares_offsite
+	count(offsite_credential_env) == 0
+	msg := sprintf(
+		"[NIS2 Art.21(2)(c)] %s '%s' claims 'nis2.eu/backup-offsite: true' but takes no object-storage secret access key from a Secret — it cannot authenticate to an off-site destination",
+		[input.kind, input.metadata.name],
+	)
+}
+
+# 3-2-1 nudge: a backup that only ever lands next to the data is one volume
+# failure away from being worthless.
+warn contains msg if {
+	input.kind == "CronJob"
+	labels := object.get(input, ["metadata", "labels"], {})
+	labels["nis2.eu/role"] == "backup"
+	not labels["nis2.eu/backup-offsite"]
+	msg := sprintf(
+		"[NIS2 Art.21(2)(c)] CronJob '%s' declares no 'nis2.eu/backup-offsite' — a backup stored only beside the data does not survive losing the volume",
 		[input.metadata.name],
 	)
 }

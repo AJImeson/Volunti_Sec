@@ -4,23 +4,48 @@
 # The mssql StatefulSet declares `nis2.eu/continuity-strategy: backup-restore`.
 # This CronJob is what makes that label true: without it the label asserts a
 # control that does not exist. policy/nis2_continuity.rego enforces the link
-# (a StatefulSet claiming 'backup-restore' must be named by a backup CronJob).
+# (a StatefulSet claiming 'backup-restore' must be named by a backup CronJob,
+# and a job claiming 'backup-offsite' must really ship the file off-cluster).
+#
+# Two stages, following 3-2-1 (>=3 copies, >=2 media, >=1 off-site):
+#
+#   initContainer 'mssql-backup'  — BACKUP DATABASE via sqlcmd, then
+#                                   RESTORE VERIFYONLY. Lands on the DB's own
+#                                   PVC: the fast local restore path.
+#   container     'offsite-upload'— copies that .bak to S3-compatible object
+#                                   storage. The copy that survives losing the
+#                                   PVC, the node, or the cluster.
+#
+# It has to be initContainer + container, not two containers: containers in a
+# pod start in parallel, initContainers run to completion in order. So the
+# upload cannot begin before the backup has finished and verified.
 #
 # Design notes:
 #   - BACKUP DATABASE writes on the *server's* filesystem, not the client's, so
-#     this pod needs no volume mount — it only speaks TDS via sqlcmd. The .bak
-#     lands in /var/opt/mssql/backups, which is inside the StatefulSet's
-#     existing mssql-data PVC. That means no second volumeClaimTemplate (those
-#     are immutable on an existing StatefulSet and would break `kubectl apply`).
-#     RESIDUAL RISK: backups share a volume with the data they protect. This
-#     covers logical loss (bad migration, accidental DROP, corrupted table) but
-#     NOT loss of the PVC/node. Shipping the .bak off-cluster is the next step.
-#   - Retention is a 7-slot rotation keyed on day-of-week (volunti-Mon.bak …).
-#     WITH FORMAT/INIT overwrites the slot, so the set is self-limiting and
-#     needs no file-deletion logic (this pod has no filesystem access anyway).
+#     stage 1 needs no mount — it only speaks TDS. Stage 2 does need the file,
+#     so it mounts the StatefulSet's PVC read-only. That PVC is RWO, which
+#     restricts it to one *node*, not one pod; the local-path PV's nodeAffinity
+#     pulls this pod onto the same node, so both can mount it.
+#   - The PVC root is mounted rather than `subPath: backups`, deliberately. On
+#     a first run the backups dir may not exist yet, and kubelet would create a
+#     missing subPath as root-owned — which SQL Server (uid 10001) then could
+#     not write into, failing every backup from then on.
+#   - The resolved filename is handed from stage 1 to stage 2 through an
+#     emptyDir rather than recomputed, so a job spanning UTC midnight cannot
+#     upload a different day's slot than it just wrote.
+#   - Retention is a 7-slot rotation keyed on day-of-week (volunti-Mon.bak …),
+#     both locally and in the bucket. WITH FORMAT/INIT overwrites the slot, so
+#     the set is self-limiting and needs no delete logic.
 #   - sqlcmd needs -b, otherwise it exits 0 even when the T-SQL fails and the
 #     job would report success while backing up nothing.
 #   - RESTORE VERIFYONLY runs every night: an unverified backup is not a backup.
+#
+# CREDENTIALS: stage 2 needs a Secret named 'mssql-backup-s3'. It does not
+# exist yet — see policy/README.md for the kubeseal command. The refs are
+# marked optional so the pod still starts without it and the *local* backup
+# still runs; the upload then fails loudly rather than skipping silently, so an
+# unconfigured off-site copy shows up as a failed Job instead of quietly
+# recreating the paper-control problem this whole job exists to fix.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -33,6 +58,7 @@ metadata:
     nis2.eu/owner: doe25-group-13
     nis2.eu/role: backup
     nis2.eu/backup-target: ${PREFIX}mssql-sts
+    nis2.eu/backup-offsite: "true"
 spec:
   schedule: "15 2 * * *"
   timeZone: "Etc/UTC"
@@ -52,7 +78,10 @@ spec:
             app: ${PREFIX}mssql-backup
         spec:
           restartPolicy: OnFailure
-          containers:
+          # ------------------------------------------------------------------
+          # Stage 1 — local backup (copy #2, on the DB's own volume)
+          # ------------------------------------------------------------------
+          initContainers:
             - name: mssql-backup
               # Reuse the server image: it already carries sqlcmd at a known
               # path and is guaranteed to be present on the node, so the backup
@@ -79,7 +108,8 @@ spec:
                   set -euo pipefail
                   SQLCMD=/opt/mssql-tools18/bin/sqlcmd
                   DOW="$(date -u +%a)"
-                  TARGET="$BACKUP_DIR/$DB_NAME-$DOW.bak"
+                  BAK_NAME="$DB_NAME-$DOW.bak"
+                  TARGET="$BACKUP_DIR/$BAK_NAME"
 
                   # -C trusts the self-signed server cert (same as the probes),
                   # -b makes a T-SQL error a non-zero exit so the Job fails.
@@ -98,7 +128,12 @@ spec:
                   echo "[backup] verifying $TARGET"
                   run "RESTORE VERIFYONLY FROM DISK = '$TARGET' WITH CHECKSUM"
 
+                  # Hand the exact filename to the upload stage.
+                  echo -n "$BAK_NAME" > /state/backup-file
                   echo "[backup] OK: $TARGET"
+              volumeMounts:
+                - name: backup-state
+                  mountPath: /state
               resources:
                 requests:
                   cpu: "50m"
@@ -113,4 +148,113 @@ spec:
                 capabilities:
                   drop:
                     - ALL
+          # ------------------------------------------------------------------
+          # Stage 2 — off-site copy (copy #3, different medium, off-cluster)
+          # ------------------------------------------------------------------
+          containers:
+            - name: offsite-upload
+              image: rclone/rclone:1.68
+              env:
+                # rclone is configured entirely from the environment, so there
+                # is no config file to mount and no credential on disk.
+                - name: RCLONE_CONFIG_OFFSITE_TYPE
+                  value: "s3"
+                # 'Other' suits MinIO/Ceph/etc; set AWS, Cloudflare, B2 … to
+                # match the real provider.
+                - name: RCLONE_CONFIG_OFFSITE_PROVIDER
+                  value: "Other"
+                # Leave empty for real AWS S3 and rely on region instead.
+                - name: RCLONE_CONFIG_OFFSITE_ENDPOINT
+                  value: ""
+                - name: RCLONE_CONFIG_OFFSITE_REGION
+                  value: "us-east-1"
+                - name: RCLONE_CONFIG_OFFSITE_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: mssql-backup-s3
+                      key: S3_ACCESS_KEY_ID
+                      optional: true
+                - name: RCLONE_CONFIG_OFFSITE_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: mssql-backup-s3
+                      key: S3_SECRET_ACCESS_KEY
+                      optional: true
+                - name: S3_BUCKET
+                  value: "volunti-backups"
+                - name: S3_PREFIX
+                  value: "mssql"
+                - name: BACKUP_DIR
+                  value: "/mssql-data/backups"
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  if [ -z "${RCLONE_CONFIG_OFFSITE_ACCESS_KEY_ID:-}" ] || \
+                     [ -z "${RCLONE_CONFIG_OFFSITE_SECRET_ACCESS_KEY:-}" ]; then
+                    echo "[offsite] ERROR: Secret 'mssql-backup-s3' is missing or empty." >&2
+                    echo "[offsite] The local backup succeeded, but there is no" >&2
+                    echo "[offsite] off-cluster copy — this Job is failing on purpose." >&2
+                    echo "[offsite] See policy/README.md for the kubeseal command." >&2
+                    exit 1
+                  fi
+
+                  BAK_NAME="$(cat /state/backup-file)"
+                  SRC="$BACKUP_DIR/$BAK_NAME"
+                  DEST_DIR="offsite:$S3_BUCKET/$S3_PREFIX"
+
+                  echo "[offsite] uploading $SRC -> $DEST_DIR/$BAK_NAME"
+                  rclone copyto "$SRC" "$DEST_DIR/$BAK_NAME" \
+                    --s3-no-check-bucket --stats-one-line
+
+                  # rclone copyto already verifies the transfer itself. This
+                  # re-reads the remote side afterwards so the job log carries
+                  # positive evidence the object is really there and the right
+                  # size. check/lsl compare directory pairs, hence --include
+                  # rather than pointing them at the file. --size-only because
+                  # a multipart upload's S3 ETag is not the file's MD5, so a
+                  # hash comparison would fail spuriously on large backups.
+                  echo "[offsite] verifying remote copy"
+                  rclone check "$BACKUP_DIR" "$DEST_DIR" \
+                    --include "$BAK_NAME" --size-only --one-way
+
+                  rclone lsl "$DEST_DIR" --include "$BAK_NAME"
+                  echo "[offsite] OK: $DEST_DIR/$BAK_NAME"
+              volumeMounts:
+                - name: backup-state
+                  mountPath: /state
+                # Read-only: this stage must never be able to alter or delete
+                # the database files or the backups it is shipping.
+                - name: mssql-data
+                  mountPath: /mssql-data
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: "50m"
+                  memory: "64Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "256Mi"
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                # runAsGroup is required, not cosmetic: SQL Server's data
+                # directory is drwxrwx--- root:10001, so traversing it needs
+                # *group* 10001. runAsUser alone leaves gid 0 and every upload
+                # fails with a permission error. fsGroup is deliberately not
+                # used — it would try to chgrp the whole database volume.
+                runAsGroup: 10001
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop:
+                    - ALL
+          volumes:
+            - name: backup-state
+              emptyDir: {}
+            - name: mssql-data
+              persistentVolumeClaim:
+                # Name generated by the StatefulSet's volumeClaimTemplate:
+                # <template>-<statefulset>-<ordinal>.
+                claimName: mssql-data-${PREFIX}mssql-sts-0
+                readOnly: true
 ---
